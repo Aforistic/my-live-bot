@@ -8,7 +8,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # Load from environment variables
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 FOOTBALL_API_KEY = os.environ.get("FOOTBALL_API_KEY")
-CHANNEL_ID = os.environ.get("CHANNEL_ID")  # e.g., '@YourChannel' or numeric ID like -1001234567890
+CHANNEL_ID = os.environ.get("CHANNEL_ID")  # e.g., '@YourChannelUsername'
 
 SUBSCRIPTION_PRICE = 5  # USD
 
@@ -46,7 +46,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Forward start info to your Telegram channel
     try:
-        bot_instance.send_message(
+        await bot_instance.send_message(
             chat_id=CHANNEL_ID,
             text=f"🆕 New user started the bot:\n"
                  f"ID: {user_id}\n"
