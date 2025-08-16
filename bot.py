@@ -2,17 +2,21 @@ import requests
 import random
 import os
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # Load from environment variables
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 FOOTBALL_API_KEY = os.environ.get("FOOTBALL_API_KEY")
+CHANNEL_ID = os.environ.get("CHANNEL_ID")  # e.g., '@YourChannel' or numeric ID like -1001234567890
 
 SUBSCRIPTION_PRICE = 5  # USD
 
 # Fake in-memory subscription system (use DB for production)
 subscribed_users = {}
+
+# Telegram bot instance to send messages to channel
+bot_instance = Bot(token=TOKEN)
 
 def get_upcoming_matches():
     url = "https://api.football-data.org/v4/matches"
@@ -34,7 +38,24 @@ def predict_match(home_team, away_team):
     }
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id
+    username = user.username or "No username"
+    first_name = user.first_name
+    last_name = user.last_name or ""
+
+    # Forward start info to your Telegram channel
+    try:
+        bot_instance.send_message(
+            chat_id=CHANNEL_ID,
+            text=f"🆕 New user started the bot:\n"
+                 f"ID: {user_id}\n"
+                 f"Username: {username}\n"
+                 f"Name: {first_name} {last_name}"
+        )
+    except Exception as e:
+        print(f"Error sending to channel: {e}")
+
     if user_id in subscribed_users:
         await update.message.reply_text(
             "🔮 **Match Prediction Bot**\n\n"
@@ -97,7 +118,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 def main():
-    if not (TOKEN and FOOTBALL_API_KEY):
+    if not (TOKEN and FOOTBALL_API_KEY and CHANNEL_ID):
         print("Missing environment variables.")
         return
 
