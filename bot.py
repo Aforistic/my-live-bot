@@ -9,21 +9,20 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 
-# Load from environment variables
+# Load environment variables
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 FOOTBALL_API_KEY = os.environ.get("FOOTBALL_API_KEY")
-CHANNEL_ID = os.environ.get("CHANNEL_ID")  # e.g., '@YourPublicChannel'
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g., "https://yourrailwayapp.up.railway.app/"
-PORT = int(os.environ.get("PORT", 8443))
+CHANNEL_ID = os.environ.get("CHANNEL_ID")  # e.g., @YourPublicChannel
 
 SUBSCRIPTION_PRICE = 5  # USD
 
 # In-memory subscription system (replace with DB for production)
 subscribed_users = {}
 
-# Bot instance for sending messages to the channel
+# Bot instance for sending messages to channel
 bot_instance = Bot(token=TOKEN)
 
+# Fetch upcoming matches
 def get_upcoming_matches():
     url = "https://api.football-data.org/v4/matches"
     headers = {"X-Auth-Token": FOOTBALL_API_KEY}
@@ -36,6 +35,7 @@ def get_upcoming_matches():
         logging.error(f"Error fetching matches: {e}")
         return []
 
+# Predict match winner
 def predict_match(home_team, away_team):
     return {
         "prediction": f"{home_team} vs {away_team}",
@@ -43,6 +43,7 @@ def predict_match(home_team, away_team):
         "odds": f"{random.uniform(1.5, 3.0):.2f}"
     }
 
+# /start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
@@ -50,7 +51,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     first_name = user.first_name
     last_name = user.last_name or ""
 
-    # Forward start info to your Telegram channel
+    # Forward start info to your channel
     try:
         await bot_instance.send_message(
             chat_id=CHANNEL_ID,
@@ -80,6 +81,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
+# /predict command
 async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in subscribed_users:
@@ -107,6 +109,7 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+# Inline button click
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = update.effective_user.id
@@ -123,8 +126,9 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
+# Main function
 def main():
-    if not (TOKEN and FOOTBALL_API_KEY and CHANNEL_ID and WEBHOOK_URL):
+    if not (TOKEN and FOOTBALL_API_KEY and CHANNEL_ID):
         logging.error("Missing environment variables.")
         return
 
@@ -133,15 +137,8 @@ def main():
     application.add_handler(CommandHandler('predict', predict))
     application.add_handler(CallbackQueryHandler(button_click))
 
-    logging.info("✅ Bot is starting with webhook...")
-
-    # Start webhook for Railway
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=TOKEN,
-        webhook_url=f"{WEBHOOK_URL}{TOKEN}"
-    )
+    logging.info("✅ Bot is running with polling...")
+    application.run_polling()  # Keeps the bot alive continuously
 
 if __name__ == "__main__":
     main()
