@@ -1,21 +1,27 @@
 import requests
 import random
 import os
+import logging
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+
 # Load from environment variables
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 FOOTBALL_API_KEY = os.environ.get("FOOTBALL_API_KEY")
-CHANNEL_ID = os.environ.get("CHANNEL_ID")  # e.g., '@YourChannelUsername'
+CHANNEL_ID = os.environ.get("CHANNEL_ID")  # e.g., '@YourPublicChannel'
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g., "https://yourrailwayapp.up.railway.app/"
+PORT = int(os.environ.get("PORT", 8443))
 
 SUBSCRIPTION_PRICE = 5  # USD
 
-# Fake in-memory subscription system (use DB for production)
+# In-memory subscription system (replace with DB for production)
 subscribed_users = {}
 
-# Telegram bot instance to send messages to channel
+# Bot instance for sending messages to the channel
 bot_instance = Bot(token=TOKEN)
 
 def get_upcoming_matches():
@@ -27,7 +33,7 @@ def get_upcoming_matches():
         matches = response.json().get("matches", [])
         return matches[:5]
     except requests.exceptions.RequestException as e:
-        print(f"Error fetching matches: {e}")
+        logging.error(f"Error fetching matches: {e}")
         return []
 
 def predict_match(home_team, away_team):
@@ -54,7 +60,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  f"Name: {first_name} {last_name}"
         )
     except Exception as e:
-        print(f"Error sending to channel: {e}")
+        logging.error(f"Error sending to channel: {e}")
 
     if user_id in subscribed_users:
         await update.message.reply_text(
@@ -118,8 +124,8 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 def main():
-    if not (TOKEN and FOOTBALL_API_KEY and CHANNEL_ID):
-        print("Missing environment variables.")
+    if not (TOKEN and FOOTBALL_API_KEY and CHANNEL_ID and WEBHOOK_URL):
+        logging.error("Missing environment variables.")
         return
 
     application = Application.builder().token(TOKEN).build()
@@ -127,8 +133,15 @@ def main():
     application.add_handler(CommandHandler('predict', predict))
     application.add_handler(CallbackQueryHandler(button_click))
 
-    print("✅ Bot is running...")
-    application.run_polling()
+    logging.info("✅ Bot is starting with webhook...")
+
+    # Start webhook for Railway
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=TOKEN,
+        webhook_url=f"{WEBHOOK_URL}{TOKEN}"
+    )
 
 if __name__ == "__main__":
     main()
