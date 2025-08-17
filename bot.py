@@ -3,7 +3,6 @@ import random
 import logging
 import requests
 from datetime import datetime
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
@@ -12,11 +11,11 @@ logging.basicConfig(level=logging.INFO)
 
 # Environment variables
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHANNEL_ID = os.environ.get("CHANNEL_ID")  # e.g., @YourPublicChannel
-FUTEBOL_TOKEN = os.environ.get("FUTEBOL_TOKEN")  # Set this if using api-futebol
+CHANNEL_ID = os.environ.get("CHANNEL_ID")
+FUTEBOL_TOKEN = os.environ.get("FUTEBOL_TOKEN")  # For api-futebol
 
 FREE_API_URLS = [
-    "https://www.scorebat.com/video-api/v3/",
+    "https://www.scorebat.com/video-api/v3/",           # Fastest first
     "https://api.api-futebol.com.br/v1/campeonatos/10/partidas"
 ]
 
@@ -40,40 +39,44 @@ def format_time(timestamp):
     except Exception:
         return "Unknown time"
 
-# Fetch predictions from APIs
+# Fetch predictions from APIs (fast)
 def fetch_predictions():
     all_predictions = []
-    for api_url in FREE_API_URLS:
-        try:
-            headers = {}
-            if "scorebat" in api_url:
-                resp = requests.get(api_url)
-                data = resp.json().get("response", [])
-                for match in data[:3]:
-                    title = match.get("title", "Unknown Match")
-                    home, away = title.split(" vs ") if " vs " in title else ("Team A", "Team B")
-                    prediction_code = random.choice(["1", "X", "2"])
-                    prediction = friendly_prediction(prediction_code, home, away)
-                    kickoff_time = format_time(match.get("date", ""))
-                    all_predictions.append(
-                        f"⚽ {title}\n🕒 Time: {kickoff_time}\n📈 Prediction: **{prediction}**"
-                    )
 
-            elif "futebol" in api_url:
-                headers = {"Authorization": f"Bearer {FUTEBOL_TOKEN}"}
-                resp = requests.get(api_url, headers=headers)
-                data = resp.json().get("partidas", [])
-                for game in data[:2]:
-                    home = game['time_mandante']['nome_popular']
-                    away = game['time_visitante']['nome_popular']
-                    time = format_time(game['data_realizacao_iso'])
-                    pred = random.choice([home, "Draw", away])
-                    all_predictions.append(
-                        f"🏆 {home} vs {away}\n🕒 Time: {time}\n🔮 Likely Winner: **{pred}**"
-                    )
+    # Scorebat first (fast)
+    try:
+        resp = requests.get(FREE_API_URLS[0], timeout=5)
+        resp.raise_for_status()
+        data = resp.json().get("response", [])[:3]  # Top 3 matches only
+        for match in data:
+            title = match.get("title", "Unknown Match")
+            home, away = title.split(" vs ") if " vs " in title else ("Team A", "Team B")
+            prediction_code = random.choice(["1", "X", "2"])
+            prediction = friendly_prediction(prediction_code, home, away)
+            kickoff_time = format_time(match.get("date", ""))
+            all_predictions.append(
+                f"⚽ {title}\n🕒 Time: {kickoff_time}\n📈 Prediction: **{prediction}**"
+            )
+    except Exception as e:
+        logging.error(f"Scorebat API error: {e}")
 
-        except Exception as e:
-            logging.error(f"API error from {api_url}: {e}")
+    # Optional: API-Futebol (slower, skip if you want faster predict)
+    try:
+        headers = {"Authorization": f"Bearer {FUTEBOL_TOKEN}"}
+        resp = requests.get(FREE_API_URLS[1], headers=headers, timeout=5)
+        resp.raise_for_status()
+        data = resp.json().get("partidas", [])[:2]  # Limit to 2 matches
+        for game in data:
+            home = game['time_mandante']['nome_popular']
+            away = game['time_visitante']['nome_popular']
+            time = format_time(game.get('data_realizacao_iso', ""))
+            pred = random.choice([home, "Draw", away])
+            all_predictions.append(
+                f"🏆 {home} vs {away}\n🕒 Time: {time}\n🔮 Likely Winner: **{pred}**"
+            )
+    except Exception as e:
+        logging.error(f"API-Futebol error: {e}")
+
     return all_predictions
 
 # /start command
@@ -108,7 +111,7 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     predictions = fetch_predictions()
     if not predictions:
-        await update.message.reply_text("⚠️ No reliable predictions available now. Try later!")
+        await update.message.reply_text("⚠️ No reliable predictions available now. Try later!", parse_mode="Markdown")
         return
 
     await update.message.reply_text("🔮 *Today's Predictions*\n\n" + "\n\n".join(predictions), parse_mode="Markdown")
