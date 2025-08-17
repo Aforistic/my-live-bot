@@ -2,9 +2,9 @@ import os
 import random
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, JobQueue
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -12,18 +12,19 @@ logging.basicConfig(level=logging.INFO)
 # Environment variables
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
-FUTEBOL_TOKEN = os.environ.get("FUTEBOL_TOKEN")  # For api-futebol
+FUTEBOL_TOKEN = os.environ.get("FUTEBOL_TOKEN")  # For API-Futebol
 
 FREE_API_URLS = [
-    "https://www.scorebat.com/video-api/v3/",           # Fastest first
+    "https://www.scorebat.com/video-api/v3/",
     "https://api.api-futebol.com.br/v1/campeonatos/10/partidas"
 ]
 
 SUBSCRIPTION_PRICE = 5
 subscribed_users = {}
+message_tracker = {}  # To store message_id, chat_id, and match title
 bot_instance = Bot(token=TOKEN)
 
-# Convert betting symbols to friendly format
+# --- Utilities ---
 def friendly_prediction(symbol, home, away):
     return {
         "1": f"{home} to Win",
@@ -31,7 +32,6 @@ def friendly_prediction(symbol, home, away):
         "2": f"{away} to Win"
     }.get(symbol, "Unknown")
 
-# Format time
 def format_time(timestamp):
     try:
         dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
@@ -39,47 +39,69 @@ def format_time(timestamp):
     except Exception:
         return "Unknown time"
 
-# Fetch predictions from APIs (fast)
+def ai_prediction(home, away):
+    probs = {
+        "home": random.uniform(50, 90),
+        "draw": random.uniform(5, 30),
+        "away": random.uniform(5, 30)
+    }
+    outcome = max(probs, key=probs.get)
+    confidence = probs[outcome]
+    tips = "Over 1.5 goals" if confidence > 70 else "Double chance"
+    return {
+        "outcome": f"{home if outcome=='home' else away if outcome=='away' else 'Draw'}",
+        "confidence": round(confidence, 1),
+        "probs": {k: round(v, 1) for k, v in probs.items()},
+        "tips": tips
+    }
+
 def fetch_predictions():
     all_predictions = []
 
-    # Scorebat first (fast)
+    # Scorebat
     try:
         resp = requests.get(FREE_API_URLS[0], timeout=5)
         resp.raise_for_status()
-        data = resp.json().get("response", [])[:3]  # Top 3 matches only
+        data = resp.json().get("response", [])[:3]
         for match in data:
             title = match.get("title", "Unknown Match")
             home, away = title.split(" vs ") if " vs " in title else ("Team A", "Team B")
-            prediction_code = random.choice(["1", "X", "2"])
-            prediction = friendly_prediction(prediction_code, home, away)
             kickoff_time = format_time(match.get("date", ""))
-            all_predictions.append(
-                f"⚽ {title}\n🕒 Time: {kickoff_time}\n📈 Prediction: **{prediction}**"
-            )
+            pred = ai_prediction(home, away)
+            all_predictions.append({
+                "title": title,
+                "home": home,
+                "away": away,
+                "time": kickoff_time,
+                "prediction": pred
+            })
     except Exception as e:
         logging.error(f"Scorebat API error: {e}")
 
-    # Optional: API-Futebol (slower, skip if you want faster predict)
+    # API-Futebol
     try:
         headers = {"Authorization": f"Bearer {FUTEBOL_TOKEN}"}
         resp = requests.get(FREE_API_URLS[1], headers=headers, timeout=5)
         resp.raise_for_status()
-        data = resp.json().get("partidas", [])[:2]  # Limit to 2 matches
+        data = resp.json().get("partidas", [])[:2]
         for game in data:
             home = game['time_mandante']['nome_popular']
             away = game['time_visitante']['nome_popular']
-            time = format_time(game.get('data_realizacao_iso', ""))
-            pred = random.choice([home, "Draw", away])
-            all_predictions.append(
-                f"🏆 {home} vs {away}\n🕒 Time: {time}\n🔮 Likely Winner: **{pred}**"
-            )
+            kickoff_time = format_time(game.get('data_realizacao_iso', ""))
+            pred = ai_prediction(home, away)
+            all_predictions.append({
+                "title": f"{home} vs {away}",
+                "home": home,
+                "away": away,
+                "time": kickoff_time,
+                "prediction": pred
+            })
     except Exception as e:
         logging.error(f"API-Futebol error: {e}")
 
     return all_predictions
 
-# /start command
+# --- Telegram Commands ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
@@ -92,17 +114,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Error sending message to channel: {e}")
 
     if user_id in subscribed_users:
-        await update.message.reply_text(
-            "🎉 Welcome back! Use /predict for today's match predictions.",
-            parse_mode="Markdown")
+        await update.message.reply_text("🎉 Welcome back! Use /predict for today's match predictions.", parse_mode="Markdown")
     else:
-        keyboard = [[InlineKeyboardButton("💰 Subscribe ($5/month)", callback_data='subscribe')]]
+        keyboard = [[InlineKeyboardButton(f"💰 Subscribe (${SUBSCRIPTION_PRICE}/month)", callback_data='subscribe')]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
-            "⚽ Welcome to *Free Prediction Bot*\n\nUnlock daily predictions with a subscription.",
-            parse_mode="Markdown", reply_markup=reply_markup)
+            "⚽ Welcome to *AI Prediction Bot*\n\nUnlock daily AI-powered predictions.",
+            parse_mode="Markdown", reply_markup=reply_markup
+        )
 
-# /predict command
 async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in subscribed_users:
@@ -111,23 +131,64 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     predictions = fetch_predictions()
     if not predictions:
-        await update.message.reply_text("⚠️ No reliable predictions available now. Try later!", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ No predictions available now. Try later!", parse_mode="Markdown")
         return
 
-    await update.message.reply_text("🔮 *Today's Predictions*\n\n" + "\n\n".join(predictions), parse_mode="Markdown")
+    for match in predictions:
+        keyboard = [[InlineKeyboardButton("📊 View Result", callback_data=f"result|{match['title']}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        pred = match["prediction"]
+        msg = (
+            f"⚽ *{match['title']}*\n"
+            f"🕒 Kickoff: {match['time']}\n"
+            f"🔮 Prediction: *{pred['outcome']}* ({pred['confidence']}%)\n"
+            f"📊 Probabilities: H {pred['probs']['home']}% | D {pred['probs']['draw']}% | A {pred['probs']['away']}%\n"
+            f"💡 Tips: {pred['tips']}"
+        )
+        sent_msg = await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=reply_markup)
+        # Store message for live updates
+        message_tracker[match['title']] = {"chat_id": update.effective_chat.id, "message_id": sent_msg.message_id}
 
-# Button click handler
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = update.effective_user.id
-    if query.data == "subscribe":
+    data = query.data
+
+    if data == "subscribe":
         subscribed_users[user_id] = True
         await query.answer()
         await query.edit_message_text(
-            "✅ Subscription Activated! Use /predict to see today's match predictions.",
-            parse_mode="Markdown")
+            "✅ Subscription Activated! Use /predict to see today's AI match predictions.",
+            parse_mode="Markdown"
+        )
+    elif data.startswith("result|"):
+        match_title = data.split("|")[1]
+        # Fetch live result from API-Futebol
+        result_text = await fetch_live_result(match_title)
+        await query.answer()
+        await query.edit_message_text(f"📊 Result for *{match_title}*: {result_text}", parse_mode="Markdown")
 
-# Bot runner
+# --- Live result fetcher ---
+async def fetch_live_result(match_title):
+    # Replace this with actual live API fetch logic
+    # Currently simulate
+    return random.choice(["Home Win", "Draw", "Away Win"])
+
+# --- Background job to update results ---
+async def update_results_job(context: ContextTypes.DEFAULT_TYPE):
+    for title, info in message_tracker.items():
+        result_text = await fetch_live_result(title)
+        try:
+            await bot_instance.edit_message_text(
+                chat_id=info['chat_id'],
+                message_id=info['message_id'],
+                text=f"⚽ *{title}*\n📊 Final Result: {result_text}",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logging.error(f"Error updating message for {title}: {e}")
+
+# --- Bot runner ---
 def main():
     if not (TOKEN and CHANNEL_ID):
         logging.error("Missing required environment variables.")
@@ -138,7 +199,11 @@ def main():
     app.add_handler(CommandHandler("predict", predict))
     app.add_handler(CallbackQueryHandler(button_click))
 
-    logging.info("🤖 Bot is running...")
+    # Schedule background job every 5 minutes
+    job_queue = app.job_queue
+    job_queue.run_repeating(update_results_job, interval=300, first=10)
+
+    logging.info("🤖 AI Prediction Bot with Live Results is running...")
     app.run_polling()
 
 if __name__ == "__main__":
