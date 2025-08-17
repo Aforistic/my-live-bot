@@ -1,5 +1,6 @@
 python-telegram-bot
 requests
 pytz
+scikit-learn
+joblib
 numpy
-sklearn
