@@ -7,6 +7,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 from telegram.error import Conflict
 import logging
 import random
+import aiohttp
 import asyncio
 
 # Configure logging
@@ -99,70 +100,69 @@ async def fetch_matches():
     all_matches = []
     seen_matches = set()
     
-    for api in sorted(ACTIVE_APIS, key=lambda x: x.get("priority", 10)):
-        try:
-            # Skip if API has failed recently
-            if api.get("last_failure") and (datetime.now() - api["last_failure"]).seconds < 3600:
-                continue
-                
-            response = await asyncio.wait_for(
-                requests.get(
-                    api["url"],
-                    headers=api.get("headers", {}),
-                    params=api.get("params", {}),
-                    timeout=10
-                ),
-                timeout=12
-            )
-            
-            if response.status_code == 403:
-                logger.error(f"API {api['name']} returned 403 - check your API key")
-                api["last_failure"] = datetime.now()
-                continue
-                
-            if response.status_code == 401:
-                logger.error(f"API {api['name']} returned 401 - unauthorized")
-                api["last_failure"] = datetime.now()
-                continue
-                
-            response.raise_for_status()
-            data = response.json()
-            
-            matches = data[api["response_key"]] if api["response_key"] else data
-            
-            for match_data in matches[:15]:  # Limit matches per API
-                try:
-                    match = api["parser"](match_data)
-                    match_key = f"{match['home']}-{match['away']}-{match['date'][:10]}"
-                    
-                    if match_key in seen_matches:
-                        continue
-                        
-                    seen_matches.add(match_key)
-                    
-                    if match["league"] in TOP_LEAGUES:
-                        all_matches.append({
-                            "home": match["home"],
-                            "away": match["away"],
-                            "date": match["date"],
-                            "league": match["league"],
-                            "source": api["name"],
-                            "match_id": match["match_id"]
-                        })
-                        
-                except Exception as e:
-                    logger.warning(f"Error parsing match from {api['name']}: {e}")
+    async with aiohttp.ClientSession() as session:
+        for api in sorted(ACTIVE_APIS, key=lambda x: x.get("priority", 10)):
+            try:
+                # Skip if API has failed recently
+                if api.get("last_failure") and (datetime.now() - api["last_failure"]).seconds < 3600:
                     continue
                     
-        except asyncio.TimeoutError:
-            logger.warning(f"API {api['name']} timed out")
-            api["last_failure"] = datetime.now()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"API {api['name']} request failed: {e}")
-            api["last_failure"] = datetime.now()
-        except Exception as e:
-            logger.error(f"Unexpected error with {api['name']}: {e}")
-            api["last_failure"] = datetime.now()
+                try:
+                    async with session.get(
+                        api["url"],
+                        headers=api.get("headers", {}),
+                        params=api.get("params", {}),
+                        timeout=aiohttp.ClientTimeout(total=10)
+                    ) as response:
+                        
+                        if response.status == 403:
+                            logger.error(f"API {api['name']} returned 403 - check your API key")
+                            api["last_failure"] = datetime.now()
+                            continue
+                            
+                        if response.status == 401:
+                            logger.error(f"API {api['name']} returned 401 - unauthorized")
+                            api["last_failure"] = datetime.now()
+                            continue
+                            
+                        data = await response.json()
+                        
+                        matches = data[api["response_key"]] if api["response_key"] else data
+                        
+                        for match_data in matches[:15]:  # Limit matches per API
+                            try:
+                                match = api["parser"](match_data)
+                                match_key = f"{match['home']}-{match['away']}-{match['date'][:10]}"
+                                
+                                if match_key in seen_matches:
+                                    continue
+                                    
+                                seen_matches.add(match_key)
+                                
+                                if match["league"] in TOP_LEAGUES:
+                                    all_matches.append({
+                                        "home": match["home"],
+                                        "away": match["away"],
+                                        "date": match["date"],
+                                        "league": match["league"],
+                                        "source": api["name"],
+                                        "match_id": match["match_id"]
+                                    })
+                                    
+                            except Exception as e:
+                                logger.warning(f"Error parsing match from {api['name']}: {e}")
+                                continue
+                                
+                except asyncio.TimeoutError:
+                    logger.warning(f"API {api['name']} timed out")
+                    api["last_failure"] = datetime.now()
+                except aiohttp.ClientError as e:
+                    logger.error(f"API {api['name']} request failed: {e}")
+                    api["last_failure"] = datetime.now()
+                    
+            except Exception as e:
+                logger.error(f"Unexpected error with {api['name']}: {e}")
+                api["last_failure"] = datetime.now()
     
     return all_matches[:20]
 
@@ -275,7 +275,8 @@ async def check_results():
     results = []
     for match_id, match_info in tracked_matches.items():
         try:
-            if random.random() > 0.7:  # Simulated result check
+            # Simulate checking results (replace with actual API call)
+            if random.random() > 0.7:  # 30% chance we have a result
                 home_goals = random.randint(0, 3)
                 away_goals = random.randint(0, 2)
                 
@@ -316,7 +317,7 @@ async def send_predictions(update: Update):
     try:
         matches = await fetch_matches()
         if not matches:
-            await update.message.reply_text("⚠️ Couldn't fetch any matches. Please try again later.")
+            await update.message.reply_text("⚠️ Couldn't fetch any matches right now. Please try again later.")
             return
 
         predictions = []
@@ -349,7 +350,7 @@ async def send_predictions(update: Update):
                 continue
 
         if not predictions:
-            await update.message.reply_text("⚠️ No high-confidence predictions available right now.")
+            await update.message.reply_text("⚠️ No high-confidence predictions available right now. Try again later.")
             return
 
         predictions.sort(key=lambda x: x[0])
