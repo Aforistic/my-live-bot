@@ -4,10 +4,10 @@ from datetime import datetime, timedelta
 import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.error import Conflict
 import logging
 import random
-import json
-from collections import defaultdict
+import asyncio
 
 # Configure logging
 logging.basicConfig(
@@ -20,18 +20,19 @@ logger = logging.getLogger(__name__)
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
 subscribed_users = set()
-bot_instance = Bot(token=TOKEN)
 
 # Tracked matches and results
 tracked_matches = {}
 match_results = {}
 
-# API Configuration with multiple reliable sources
+# API Configuration with enhanced error handling
 API_CONFIGS = [
     {
         "name": "football-data",
         "url": "https://api.football-data.org/v4/matches",
         "headers": {"X-Auth-Token": os.environ.get("FOOTBALL_DATA_KEY")},
+        "params": {},
+        "active": bool(os.environ.get("FOOTBALL_DATA_KEY")),
         "parser": lambda x: {
             "home": x.get("homeTeam", {}).get("shortName", x.get("homeTeam", {}).get("name", "Unknown")),
             "away": x.get("awayTeam", {}).get("shortName", x.get("awayTeam", {}).get("name", "Unknown")),
@@ -40,13 +41,14 @@ API_CONFIGS = [
             "match_id": f"{x.get('id', random.randint(10000, 99999))}"
         },
         "response_key": "matches",
-        "priority": 1  # Highest priority
+        "priority": 1
     },
     {
         "name": "api-football",
         "url": "https://v3.football.api-sports.io/fixtures",
         "headers": {"x-rapidapi-key": os.environ.get("API_FOOTBALL_KEY")},
         "params": {"live": "all"},
+        "active": bool(os.environ.get("API_FOOTBALL_KEY")),
         "parser": lambda x: {
             "home": x["teams"]["home"]["name"],
             "away": x["teams"]["away"]["name"],
@@ -65,6 +67,8 @@ if os.environ.get("FUTEBOL_TOKEN"):
         "name": "api-futebol",
         "url": "https://api.api-futebol.com.br/v1/campeonatos/10/partidas",
         "headers": {"Authorization": f"Bearer {os.environ.get('FUTEBOL_TOKEN')}"},
+        "params": {},
+        "active": True,
         "parser": lambda x: {
             "home": x.get("time_mandante", {}).get("nome_popular", "Unknown"),
             "away": x.get("time_visitante", {}).get("nome_popular", "Unknown"),
@@ -75,6 +79,9 @@ if os.environ.get("FUTEBOL_TOKEN"):
         "response_key": "partidas",
         "priority": 3
     })
+
+# Filter out inactive APIs
+ACTIVE_APIS = [api for api in API_CONFIGS if api.get("active", True)]
 
 TOP_LEAGUES = {
     "PL": "Premier League",
@@ -88,36 +95,51 @@ TOP_LEAGUES = {
 }
 
 async def fetch_matches():
-    """Fetch matches from all APIs with priority handling"""
+    """Fetch matches from all APIs with comprehensive error handling"""
     all_matches = []
-    seen_matches = set()  # To avoid duplicates
+    seen_matches = set()
     
-    # Sort APIs by priority
-    for api in sorted(API_CONFIGS, key=lambda x: x.get("priority", 10)):
+    for api in sorted(ACTIVE_APIS, key=lambda x: x.get("priority", 10)):
         try:
-            response = requests.get(
-                api["url"],
-                headers=api.get("headers", {}),
-                params=api.get("params", {}),
-                timeout=10
+            # Skip if API has failed recently
+            if api.get("last_failure") and (datetime.now() - api["last_failure"]).seconds < 3600:
+                continue
+                
+            response = await asyncio.wait_for(
+                requests.get(
+                    api["url"],
+                    headers=api.get("headers", {}),
+                    params=api.get("params", {}),
+                    timeout=10
+                ),
+                timeout=12
             )
+            
+            if response.status_code == 403:
+                logger.error(f"API {api['name']} returned 403 - check your API key")
+                api["last_failure"] = datetime.now()
+                continue
+                
+            if response.status_code == 401:
+                logger.error(f"API {api['name']} returned 401 - unauthorized")
+                api["last_failure"] = datetime.now()
+                continue
+                
             response.raise_for_status()
             data = response.json()
             
             matches = data[api["response_key"]] if api["response_key"] else data
             
-            for match_data in matches:
+            for match_data in matches[:15]:  # Limit matches per API
                 try:
                     match = api["parser"](match_data)
                     match_key = f"{match['home']}-{match['away']}-{match['date'][:10]}"
                     
-                    # Skip if we already have this match from a higher priority source
                     if match_key in seen_matches:
                         continue
                         
                     seen_matches.add(match_key)
                     
-                    # Only include matches from top leagues
                     if match["league"] in TOP_LEAGUES:
                         all_matches.append({
                             "home": match["home"],
@@ -132,12 +154,17 @@ async def fetch_matches():
                     logger.warning(f"Error parsing match from {api['name']}: {e}")
                     continue
                     
+        except asyncio.TimeoutError:
+            logger.warning(f"API {api['name']} timed out")
+            api["last_failure"] = datetime.now()
         except requests.exceptions.RequestException as e:
             logger.error(f"API {api['name']} request failed: {e}")
+            api["last_failure"] = datetime.now()
         except Exception as e:
             logger.error(f"Unexpected error with {api['name']}: {e}")
+            api["last_failure"] = datetime.now()
     
-    return all_matches[:20]  # Return max 20 matches
+    return all_matches[:20]
 
 def enhanced_prediction(home, away, league):
     """AI-enhanced prediction combining multiple factors"""
@@ -146,14 +173,14 @@ def enhanced_prediction(home, away, league):
         home_strength = random.uniform(0.5, 1.0)
         away_strength = random.uniform(0.4, 0.9)
         
-        # League modifiers (some leagues have more home advantage)
+        # League modifiers
         league_modifiers = {
             "PL": 1.1, "PD": 1.0, "BL1": 1.2, 
             "SA": 0.9, "FL1": 1.0, "CL": 1.1, "BRA": 1.0
         }
         league_mod = league_modifiers.get(league, 1.0)
         
-        # Recent form simulation (last 5 matches)
+        # Recent form simulation
         home_form = random.uniform(0.4, 0.8)
         away_form = random.uniform(0.3, 0.7)
         
@@ -173,7 +200,6 @@ def enhanced_prediction(home, away, league):
         
         # High confidence threshold (90%+)
         if confidence >= 90:
-            # Apply additional checks for very high confidence
             if home_pct >= 90:
                 outcome = "Home Win"
                 confidence = min(99, home_pct * 1.05)
@@ -227,15 +253,15 @@ def precise_countdown(match_time):
         delta = match_time - now
         total_seconds = int(delta.total_seconds())
         
-        if total_seconds > 86400:  # More than 1 day
+        if total_seconds > 86400:
             days = total_seconds // 86400
             hours = (total_seconds % 86400) // 3600
             return f"⏳ {days}d {hours}h until kickoff"
-        elif total_seconds > 3600:  # More than 1 hour
+        elif total_seconds > 3600:
             hours = total_seconds // 3600
             minutes = (total_seconds % 3600) // 60
             return f"⏳ {hours}h {minutes}m until kickoff"
-        elif total_seconds > 60:  # More than 1 minute
+        elif total_seconds > 60:
             minutes = total_seconds // 60
             seconds = total_seconds % 60
             return f"⏳ {minutes}m {seconds}s until kickoff"
@@ -249,9 +275,7 @@ async def check_results():
     results = []
     for match_id, match_info in tracked_matches.items():
         try:
-            # In a real implementation, you would query an API for results
-            # This is a simulation
-            if random.random() > 0.7:  # 30% chance we have a result
+            if random.random() > 0.7:  # Simulated result check
                 home_goals = random.randint(0, 3)
                 away_goals = random.randint(0, 2)
                 
@@ -263,7 +287,6 @@ async def check_results():
                 else:
                     outcome = "Draw"
                 
-                # Check if prediction was correct
                 prediction_correct = (
                     (outcome == match_info['prediction']["outcome"]) or
                     (outcome == "Draw" and "Draw" in match_info['prediction']["outcome"])
@@ -276,7 +299,6 @@ async def check_results():
                     f"🏆 {TOP_LEAGUES.get(match_info['league'], 'Unknown League')}\n"
                 )
                 
-                # Store result and remove from tracked matches
                 match_results[match_id] = {
                     "result": result,
                     "outcome": outcome,
@@ -305,7 +327,6 @@ async def send_predictions(update: Update):
                 countdown = precise_countdown(match_time)
                 league_name = TOP_LEAGUES.get(match["league"], "Other League")
                 
-                # Only show high confidence predictions (90%+)
                 if pred["confidence"] >= 90:
                     predictions.append((
                         match_time,
@@ -314,10 +335,8 @@ async def send_predictions(update: Update):
                         f"⏰ {match_time.strftime('%a %d %b %H:%M')} | {countdown}\n"
                         f"🔮 *Prediction:* {pred['outcome']} ({pred['confidence']:.1f}% confidence)\n"
                         f"📊 Stats: H {pred['probs']['home']}% | D {pred['probs']['draw']}% | A {pred['probs']['away']}%\n"
-                        f"💡 *Tip:* {get_betting_tip(pred, match['league'])}\n"
                     ))
                     
-                    # Track this match for results checking
                     tracked_matches[match["match_id"]] = {
                         "home": match["home"],
                         "away": match["away"],
@@ -333,17 +352,14 @@ async def send_predictions(update: Update):
             await update.message.reply_text("⚠️ No high-confidence predictions available right now.")
             return
 
-        # Sort by match time
         predictions.sort(key=lambda x: x[0])
         
-        # Send in chunks of 3 matches
         for i in range(0, len(predictions), 3):
             await update.message.reply_text(
                 "⚽ *Top Match Predictions* ⚽\n\n" + "\n".join([p[1] for p in predictions[i:i+3]]),
                 parse_mode="Markdown"
             )
             
-        # Add results button if we have tracked matches
         if tracked_matches:
             keyboard = [[InlineKeyboardButton("📊 Check Results", callback_data='check_results')]]
             await update.message.reply_text(
@@ -363,7 +379,6 @@ async def show_results(update: Update):
             await update.message.reply_text("No results available yet. Check back later!")
             return
             
-        # Send in chunks of 3 results
         for i in range(0, len(results), 3):
             await update.message.reply_text(
                 "🏁 *Match Results* 🏁\n\n" + "\n".join(results[i:i+3]),
@@ -379,7 +394,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
     try:
-        await bot_instance.send_message(
+        bot = Bot(token=TOKEN)
+        await bot.send_message(
             chat_id=CHANNEL_ID,
             text=f"👤 New user:\nID: {user.id}\nUsername: @{user.username or 'N/A'}\nName: {user.full_name}"
         )
@@ -413,17 +429,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         subscribed_users.add(query.from_user.id)
         await query.edit_message_text("✅ Subscribed! Use /predict for high-confidence match predictions.")
     elif query.data == 'check_results':
-        await show_results(update)
+        await show_results(query)
 
 def main():
-    """Start the bot"""
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("predict", predict))
-    app.add_handler(CallbackQueryHandler(button_handler))
+    """Start the bot with conflict handling"""
+    application = Application.builder().token(TOKEN).build()
     
-    logger.info("Enhanced Football Predictor Bot is running...")
-    app.run_polling()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("predict", predict))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    
+    logger.info("Starting bot with conflict handling...")
+    
+    try:
+        application.run_polling(
+            close_loop=False,
+            stop_signals=None,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
+    except Conflict as e:
+        logger.error(f"Bot conflict detected: {e}")
+        import time
+        time.sleep(5)
+        main()  # Restart the bot
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
 
 if __name__ == "__main__":
     main()
