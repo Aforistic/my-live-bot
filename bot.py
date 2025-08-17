@@ -7,6 +7,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 from telegram.error import Conflict
 import logging
 import random
+import asyncio
 
 # Configure logging
 logging.basicConfig(
