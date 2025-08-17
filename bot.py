@@ -20,43 +20,43 @@ CHANNEL_ID = os.environ.get("CHANNEL_ID")
 subscribed_users = set()
 bot_instance = Bot(token=TOKEN)
 
-# API Configuration with robust fallbacks
-API_CONFIGS = [
+# Multiple API Sources with proper fallbacks
+API_SOURCES = [
     {
         "name": "football-data",
         "url": "https://api.football-data.org/v4/matches",
         "headers": {"X-Auth-Token": os.environ.get("FOOTBALL_DATA_KEY")},
         "parser": lambda x: {
-            "home": x.get("homeTeam", {}).get("name", "Home Team"),
-            "away": x.get("awayTeam", {}).get("name", "Away Team"),
-            "date": x.get("utcDate", ""),
-            "league": x.get("competition", {}).get("code", "UNK")
+            "home": x["homeTeam"]["name"],
+            "away": x["awayTeam"]["name"],
+            "date": x["utcDate"],
+            "league": x["competition"]["code"]
         },
         "response_key": "matches"
     },
     {
         "name": "scorebat",
-        "url": "https://www.scorebat.com/video-api/v1/",  # Updated to v1 which is more stable
+        "url": "https://www.scorebat.com/video-api/v3/",
         "parser": lambda x: {
-            "home": x.get("title", "").split(" vs ")[0] if " vs " in x.get("title", "") else "Home Team",
-            "away": x.get("title", "").split(" vs ")[1] if " vs " in x.get("title", "") else "Away Team",
-            "date": x.get("date", ""),
+            "home": x["title"].split(" vs ")[0] if " vs " in x["title"] else "Team A",
+            "away": x["title"].split(" vs ")[1] if " vs " in x["title"] else "Team B",
+            "date": x["date"],
             "league": "UNK"
         },
         "response_key": None  # Entire response is the array
     }
 ]
 
-# Only add Brazilian API if token is available
+# Add Brazilian API only if token is available
 if os.environ.get("FUTEBOL_TOKEN"):
-    API_CONFIGS.append({
+    API_SOURCES.append({
         "name": "api-futebol",
         "url": "https://api.api-futebol.com.br/v1/campeonatos/10/partidas",
         "headers": {"Authorization": f"Bearer {os.environ.get('FUTEBOL_TOKEN')}"},
         "parser": lambda x: {
-            "home": x.get("time_mandante", {}).get("nome_popular", "Home Team"),
-            "away": x.get("time_visitante", {}).get("nome_popular", "Away Team"),
-            "date": x.get("data_realizacao", ""),
+            "home": x["time_mandante"]["nome_popular"],
+            "away": x["time_visitante"]["nome_popular"],
+            "date": x["data_realizacao"],
             "league": "BRA"
         },
         "response_key": "partidas"
@@ -71,23 +71,19 @@ LEAGUE_NAMES = {
     "CL": "Champions League",
     "ELC": "Championship",
     "BRA": "Brasileirão",
-    "UNK": "Other Leagues"
+    "UNK": "Unknown League"
 }
 
 async def fetch_matches():
-    """Fetch matches from all APIs with comprehensive error handling"""
+    """Fetch matches from all available APIs with robust error handling"""
     all_matches = []
     
-    for api in API_CONFIGS:
+    for api in API_SOURCES:
         try:
-            # Skip API if it's the Brazilian one and we're getting 401 errors
-            if api["name"] == "api-futebol" and "401" in str(api.get("last_error", "")):
-                continue
-                
             response = requests.get(
                 api["url"],
                 headers=api.get("headers", {}),
-                timeout=15
+                timeout=10
             )
             response.raise_for_status()
             data = response.json()
@@ -98,62 +94,37 @@ async def fetch_matches():
             for match_data in matches[:10]:  # Limit to 10 matches per API
                 try:
                     match = api["parser"](match_data)
-                    if not all(match.values()):  # Skip if any field is empty
-                        continue
-                        
-                    all_matches.append({
-                        "home": match["home"],
-                        "away": match["away"],
-                        "date": match["date"],
-                        "league": match["league"],
-                        "source": api["name"]
-                    })
+                    # Validate we got all required fields
+                    if all(key in match for key in ["home", "away", "date", "league"]):
+                        all_matches.append({
+                            "home": match["home"],
+                            "away": match["away"],
+                            "date": match["date"],
+                            "league": match["league"],
+                            "source": api["name"]
+                        })
                 except Exception as e:
                     logger.warning(f"Error parsing match from {api['name']}: {e}")
                     continue
                     
         except requests.exceptions.RequestException as e:
             logger.error(f"API {api['name']} request failed: {e}")
-            api["last_error"] = str(e)  # Store error to prevent retrying
         except Exception as e:
             logger.error(f"Unexpected error with {api['name']}: {e}")
     
-    return all_matches[:20]  # Return max 20 matches
+    return all_matches[:15]  # Return max 15 matches
 
-def get_prediction(home, away, league):
-    """Improved prediction algorithm with league context"""
+def get_prediction(home, away):
+    """Improved prediction algorithm with fallback"""
     try:
-        # Base probabilities with league weighting
-        league_weight = 1.2 if league in ["PL", "CL"] else 1.0
-        home_win = random.uniform(0.7, 0.9) * league_weight
-        draw = random.uniform(0.1, 0.3) * league_weight
-        away_win = random.uniform(0.1, 0.5) * league_weight
-        
-        # Normalize to 100%
-        total = home_win + draw + away_win
-        home_pct = round((home_win/total)*100, 1)
-        draw_pct = round((draw/total)*100, 1)
-        away_pct = round((away_win/total)*100, 1)
-        
-        outcome = "Home Win" if home_pct > away_pct and home_pct > draw_pct else \
-                 "Away Win" if away_pct > home_pct and away_pct > draw_pct else "Draw"
-                 
-        return {
-            "outcome": outcome,
-            "confidence": max(home_pct, draw_pct, away_pct),
-            "probs": {
-                "home": home_pct,
-                "draw": draw_pct,
-                "away": away_pct
-            }
-        }
-    except Exception as e:
-        logger.error(f"Prediction error: {e}")
-        return {
-            "outcome": "Draw",
-            "confidence": 80.0,
-            "probs": {"home": 40, "draw": 35, "away": 25}
-        }
+        outcomes = [
+            {"outcome": f"{home} win", "confidence": random.randint(80, 92)},
+            {"outcome": "Draw", "confidence": random.randint(75, 85)},
+            {"outcome": f"{away} win", "confidence": random.randint(78, 90)}
+        ]
+        return max(outcomes, key=lambda x: x["confidence"])
+    except:
+        return {"outcome": "Draw", "confidence": 80}
 
 def parse_match_time(date_str, source):
     """Robust time parsing for different API formats"""
@@ -163,11 +134,10 @@ def parse_match_time(date_str, source):
         elif source == "api-futebol":
             return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S%z")
         else:  # football-data
-            dt = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ")
-            return dt.replace(tzinfo=pytz.UTC)
+            return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.UTC)
     except Exception as e:
         logger.error(f"Time parsing failed: {e}")
-        return datetime.now(pytz.utc) + timedelta(hours=2)  # Fallback: 2 hours from now
+        return datetime.now(pytz.utc) + timedelta(hours=1)  # Fallback time
 
 async def send_predictions(update: Update):
     """Send predictions with comprehensive error handling"""
@@ -180,17 +150,16 @@ async def send_predictions(update: Update):
         predictions = []
         for match in matches:
             try:
-                pred = get_prediction(match["home"], match["away"], match["league"])
+                pred = get_prediction(match["home"], match["away"])
                 match_time = parse_match_time(match["date"], match["source"])
                 countdown = get_countdown(match_time)
-                league_name = LEAGUE_NAMES.get(match["league"], "Other League")
+                league_name = LEAGUE_NAMES.get(match["league"], "Unknown League")
                 
                 predictions.append(
                     f"🏆 *{league_name}*\n"
-                    f"⚔️ *{match['home']} vs {match['away']}*\n"
+                    f"⚽ *{match['home']} vs {match['away']}*\n"
                     f"⏰ {match_time.strftime('%a %d %b %H:%M')} | {countdown}\n"
-                    f"🔮 *Prediction:* {pred['outcome']} ({pred['confidence']:.1f}%)\n"
-                    f"📊 Stats: H {pred['probs']['home']}% | D {pred['probs']['draw']}% | A {pred['probs']['away']}%\n"
+                    f"🔮 *Prediction:* {pred['outcome']} ({pred['confidence']}%)\n"
                     f"💡 *Tip:* {get_betting_tip(pred, match['league'])}\n"
                 )
             except Exception as e:
@@ -200,7 +169,7 @@ async def send_predictions(update: Update):
         # Send in chunks of 3 matches
         for i in range(0, len(predictions), 3):
             await update.message.reply_text(
-                "⚽ *Match Predictions* ⚽\n\n" + "\n".join(predictions[i:i+3]),
+                "📅 *Match Predictions* 📅\n\n" + "\n".join(predictions[i:i+3]),
                 parse_mode="Markdown"
             )
             
@@ -221,17 +190,9 @@ def get_countdown(match_time):
 def get_betting_tip(prediction, league_id):
     """League-specific betting tips"""
     if prediction["confidence"] > 85:
-        if "Home" in prediction["outcome"]:
-            return "Home win & Over 1.5 goals"
-        elif "Away" in prediction["outcome"]:
-            return "Away win or Draw No Bet"
-    
-    # League-specific suggestions
-    if league_id in ["PL", "BL1"]:
-        return "Both Teams to Score"
-    elif league_id == "SA":
-        return "Under 2.5 goals"
-    return "Double Chance"
+        if "win" in prediction["outcome"]:
+            return "Win & Over 1.5 goals"
+    return "Double Chance" if random.random() > 0.5 else "Under 2.5 goals"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command with user tracking"""
@@ -243,8 +204,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=CHANNEL_ID,
             text=f"👤 New user:\n"
                  f"ID: {user.id}\n"
-                 f"Username: @{user.username or 'N/A'}\n"
-                 f"Name: {user.full_name}"
+                 f"Name: {user.full_name}\n"
+                 f"Username: @{user.username or 'N/A'}"
         )
     except Exception as e:
         logger.error(f"Tracking error: {e}")
