@@ -4,4 +4,4 @@ pytz
 scikit-learn
 joblib
 numpy
-dateutil
+python-dateutil
