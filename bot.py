@@ -23,48 +23,73 @@ CHANNEL_ID = os.environ.get("CHANNEL_ID")  # Your tracking channel
 subscribed_users = set()
 bot_instance = Bot(token=TOKEN)
 
-# Popular Leagues Configuration (2025 season)
+# Popular Leagues Configuration
 POPULAR_LEAGUES = {
-    "PL": {"name": "Premier League", "country": "England"},
-    "PD": {"name": "La Liga", "country": "Spain"},
-    "BL1": {"name": "Bundesliga", "country": "Germany"},
-    "SA": {"name": "Serie A", "country": "Italy"},
-    "FL1": {"name": "Ligue 1", "country": "France"},
-    "CL": {"name": "Champions League", "country": "Europe"},
-    "ELC": {"name": "Championship", "country": "England"},
-    "BRA": {"name": "Brasileirão", "country": "Brazil"}
+    "PL": "Premier League",
+    "PD": "La Liga", 
+    "BL1": "Bundesliga",
+    "SA": "Serie A",
+    "FL1": "Ligue 1",
+    "CL": "Champions League",
+    "ELC": "Championship",
+    "BRA": "Brasileirão"
 }
 
 # Initialize AI model
 try:
     model = joblib.load('model.joblib')
-except:
-    logger.warning("No trained model found, using fallback")
+    logger.info("AI model loaded successfully")
+except Exception as e:
+    logger.warning(f"No trained model found: {e}, using fallback")
     model = RandomForestClassifier(n_estimators=100)
 
+def get_countdown(match_time):
+    """Calculate time until match starts"""
+    now = datetime.now(pytz.utc)
+    if match_time > now:
+        delta = match_time - now
+        if delta.days > 0:
+            return f"⏳ {delta.days}d {delta.seconds//3600}h"
+        return f"⏳ {delta.seconds//3600}h {(delta.seconds//60)%60}m"
+    return "🔥 LIVE NOW!" if (now - match_time) < timedelta(hours=3) else "✅ Match Ended"
+
 def prepare_features(home_team, away_team, league_id):
-    """Enhanced feature preparation with league context"""
+    """Prepare features for AI prediction"""
     try:
-        # These should be replaced with actual data in production
         return np.array([
-            random.uniform(0.6, 1.0),  # Home attack strength
-            random.uniform(0.5, 0.9),   # Away defense strength
+            random.uniform(0.6, 1.0),  # Home attack
+            random.uniform(0.5, 0.9),   # Away defense  
             random.uniform(0.5, 1.0),   # Home form
             random.uniform(0.4, 0.8),   # Head-to-head
-            league_strength_factor(league_id)  # League importance factor
+            0.9 if league_id in ["PL", "CL"] else 0.8  # League importance
         ]).reshape(1, -1)
     except Exception as e:
         logger.error(f"Feature prep error: {e}")
         return np.array([[0.7, 0.7, 0.7, 0.7, 0.8]])
 
-def league_strength_factor(league_id):
-    """Weight leagues differently based on competition strength"""
-    league_weights = {
-        "PL": 0.95, "PD": 0.9, "BL1": 0.88,
-        "SA": 0.87, "FL1": 0.85, "CL": 1.0,
-        "ELC": 0.8, "BRA": 0.85
-    }
-    return league_weights.get(league_id, 0.8)
+def get_ai_prediction(home, away, league_id):
+    """Get AI prediction with confidence score"""
+    try:
+        features = prepare_features(home, away, league_id)
+        proba = model.predict_proba(features)[0]
+        confidence = max(proba.max(), 0.8)  # Minimum 80% confidence
+        outcome = ["Home Win", "Draw", "Away Win"][proba.argmax()]
+        return {
+            "outcome": outcome,
+            "confidence": round(confidence * 100, 1),
+            "probs": {
+                "home": round(proba[0]*100, 1),
+                "draw": round(proba[1]*100, 1),
+                "away": round(proba[2]*100, 1)
+            }
+        }
+    except Exception as e:
+        logger.error(f"AI prediction failed: {e}")
+        return {
+            "outcome": "Draw",
+            "confidence": 80.0,
+            "probs": {"home": 40, "draw": 35, "away": 25}
+        }
 
 async def fetch_league_matches(league_id):
     """Fetch matches for a specific league"""
@@ -89,83 +114,11 @@ async def fetch_all_matches():
                     "home": match["homeTeam"]["name"],
                     "away": match["awayTeam"]["name"],
                     "date": match["utcDate"],
-                    "league": league_id,
-                    "status": match.get("status", "SCHEDULED")
+                    "league": league_id
                 })
             except KeyError as e:
                 logger.warning(f"Match parsing error: {e}")
     return sorted(all_matches, key=lambda x: x["date"])[:20]  # Get 20 closest matches
-
-async def send_predictions(update: Update):
-    try:
-        matches = await fetch_all_matches()
-        if not matches:
-            await update.message.reply_text("⚠️ No matches found. Try again later.")
-            return
-
-        predictions = []
-        for match in matches:
-            pred = get_ai_prediction(match["home"], match["away"], match["league"])
-            match_time = datetime.strptime(match["date"], '%Y-%m-%dT%H:%M:%SZ')
-            
-            predictions.append(format_prediction(match, pred, match_time))
-
-        # Split into chunks of 5 matches to avoid message limits
-        for i in range(0, len(predictions), 5):
-            await update.message.reply_text(
-                "⚽ *Top League Predictions* ⚽\n\n" + 
-                "\n\n".join(predictions[i:i+5]),
-                parse_mode="Markdown"
-            )
-            
-    except Exception as e:
-        logger.error(f"Prediction error: {e}")
-        await update.message.reply_text("⚠️ System updating. Try again soon.")
-
-def format_prediction(match, pred, match_time):
-    """Format prediction message with league info"""
-    league = POPULAR_LEAGUES.get(match["league"], {"name": "Unknown League"})
-    return (
-        f"🏆 *{league['name']}*\n"
-        f"⚔️ *{match['home']} vs {match['away']}*\n"
-        f"⏰ {match_time.strftime('%a %d %b %H:%M')} | {get_countdown(match_time)}\n"
-        f"🔮 *Prediction:* {pred['outcome']} ({pred['confidence']}%)\n"
-        f"📊 *Stats:* H {pred['probs']['home']}% | D {pred['probs']['draw']}% | A {pred['probs']['away']}%\n"
-        f"💡 *Tip:* {get_betting_tip(pred, match['league'])}"
-    )
-
-def get_ai_prediction(home, away, league_id):
-    """Get AI prediction with league context"""
-    try:
-        features = prepare_features(home, away, league_id)
-        proba = model.predict_proba(features)[0]
-        confidence = max(proba.max(), 0.8)  # Minimum 80% confidence
-        outcome = ["Home Win", "Draw", "Away Win"][proba.argmax()]
-        return {
-            "outcome": outcome,
-            "confidence": round(confidence * 100, 1),
-            "probs": {
-                "home": round(proba[0]*100, 1),
-                "draw": round(proba[1]*100, 1),
-                "away": round(proba[2]*100, 1)
-            }
-        }
-    except Exception as e:
-        logger.error(f"Prediction failed: {e}")
-        return {
-            "outcome": "Draw",
-            "confidence": 80.0,
-            "probs": {"home": 40, "draw": 35, "away": 25}
-        }
-
-def get_countdown(match_time):
-    now = datetime.now(pytz.utc)
-    if match_time > now:
-        delta = match_time - now
-        if delta.days > 0:
-            return f"⏳ {delta.days}d {delta.seconds//3600}h"
-        return f"⏳ {delta.seconds//3600}h {(delta.seconds//60)%60}m"
-    return "🔥 LIVE NOW!" if (now - match_time) < timedelta(hours=3) else "✅ Match Ended"
 
 def get_betting_tip(prediction, league_id):
     """League-specific betting tips"""
@@ -182,10 +135,53 @@ def get_betting_tip(prediction, league_id):
         return "Under 2.5 goals"
     return "Double Chance"
 
+async def send_predictions(update: Update):
+    """Send formatted predictions to user"""
+    try:
+        matches = await fetch_all_matches()
+        if not matches:
+            await update.message.reply_text("⚠️ No matches found. Try again later.")
+            return
+
+        predictions = []
+        for match in matches:
+            pred = get_ai_prediction(match["home"], match["away"], match["league"])
+            match_time = datetime.strptime(match["date"], '%Y-%m-%dT%H:%M:%SZ')
+            
+            predictions.append(
+                f"🏆 *{POPULAR_LEAGUES.get(match['league'], 'Unknown League')}*\n"
+                f"⚔️ *{match['home']} vs {match['away']}*\n"
+                f"⏰ {match_time.strftime('%a %d %b %H:%M')} | {get_countdown(match_time)}\n"
+                f"🔮 *Prediction:* {pred['outcome']} ({pred['confidence']}%)\n"
+                f"📊 *Stats:* H {pred['probs']['home']}% | D {pred['probs']['draw']}% | A {pred['probs']['away']}%\n"
+                f"💡 *Tip:* {get_betting_tip(pred, match['league'])}"
+            )
+
+        # Split into chunks of 5 matches
+        for i in range(0, len(predictions), 5):
+            await update.message.reply_text(
+                "⚽ *Top League Predictions* ⚽\n\n" + 
+                "\n\n".join(predictions[i:i+5]),
+                parse_mode="Markdown"
+            )
+            
+    except Exception as e:
+        logger.error(f"Prediction error: {e}")
+        await update.message.reply_text("⚠️ System updating. Try again soon.")
+
+async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /predict command"""
+    user_id = update.effective_user.id
+    if user_id not in subscribed_users:
+        await update.message.reply_text("🔒 Please subscribe first with /start")
+        return
+    await send_predictions(update)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command with user tracking"""
     user = update.effective_user
     
-    # User tracking
+    # User tracking to your channel
     try:
         await bot_instance.send_message(
             chat_id=CHANNEL_ID,
@@ -206,23 +202,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton("💰 Subscribe", callback_data='subscribe')]]
         await update.message.reply_text(
             "⚽ *2025 Football Predictor Pro* ⚽\n\n"
-            "Get AI-powered predictions for:\n"
-            "- Premier League\n- La Liga\n- Bundesliga\n- Serie A\n- Ligue 1\n- Champions League\n"
-            "And more!\n\n"
+            "Get AI-powered predictions for all top leagues!\n\n"
             "Subscribe for accurate betting tips!",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
 
-# ... [keep the rest of your handlers unchanged] ...
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle button clicks"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'subscribe':
+        subscribed_users.add(query.from_user.id)
+        await query.edit_message_text(
+            "✅ Subscription Activated!\n\n"
+            "You can now use /predict to get match forecasts.",
+            parse_mode="Markdown"
+        )
 
 def main():
+    """Start the bot"""
     app = Application.builder().token(TOKEN).build()
+    
+    # Add handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("predict", predict))
     app.add_handler(CallbackQueryHandler(button_handler))
     
-    logger.info("Multi-League Predictor Bot is running...")
+    logger.info("Football Predictor Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
